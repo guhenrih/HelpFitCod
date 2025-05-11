@@ -1,65 +1,59 @@
 # backEnd.py
 """
 Módulo de backend para a aplicação HelpFit.
-Implementa lógica de persistência em SQLite e análise com pandas, numpy e scikit-learn.
-As funcionalidades são separadas por área de página:
-  - Cadastro de alunos
-  - Registro de frequência
-  - Obtenção de informações e estatísticas
-  - Exclusão de alunos
+Implementa lógica de persistência em SQLite e análise com pandas e numpy.
+Inclui migração de schema automática para novas colunas.
 """
 import sqlite3
 from sqlite3 import Connection
 from datetime import datetime, date
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LogisticRegression
 
 DB_FILE = 'helpfit.db'
 
 # -------------------------------------------------------------
-# Conexão e inicialização do banco
+# Conexão com banco
 # -------------------------------------------------------------
 def get_connection() -> Connection:
     """
     Abre conexão com SQLite, garantindo foreign_keys ativadas.
-    Retorna conexão.
     """
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-
+# -------------------------------------------------------------
+# Inicialização e migração do banco
+# -------------------------------------------------------------
 def init_db():
     """
-    Cria as tabelas essenciais se ainda não existirem:
-      - students: armazena dados pessoais e contratuais
-      - attendance: armazena registros de presença/falta
-    Adiciona índices para melhorar performance de consulta.
+    Cria tabelas essenciais se não existirem e aplica migração de schema.
+    - students: alunos
+    - attendance: frequência
+    - justifications: justificativas de faltas
     """
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Tabela de alunos
-    cursor.execute(
-        '''
+    # Tabela students
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS students (
             id TEXT PRIMARY KEY,
             nome TEXT NOT NULL,
             cpf TEXT UNIQUE NOT NULL,
             data_matricula TEXT NOT NULL,
-            data_nascimento TEXT,
             telefone TEXT,
             sexo TEXT,
             comorbidade TEXT,
             dias_contratados INTEGER NOT NULL,
-            valor_plano REAL NOT NULL
+            valor_plano REAL NOT NULL,
+            data_nascimento TEXT
         );
-        '''
-    )
-    # Tabela de frequência
-    cursor.execute(
-        '''
+    ''')
+
+    # Tabela attendance
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id TEXT NOT NULL,
@@ -67,18 +61,30 @@ def init_db():
             present INTEGER NOT NULL,
             FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
         );
-        '''
-    )
+    ''')
 
-    # Índices para buscas rápidas
+    # Tabela justifications
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS justifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            reason TEXT,
+            canceled INTEGER,
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+        );
+    ''')
+
+    # Índices
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_students_cpf ON students(cpf);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance(student_id);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_just_student ON justifications(student_id);')
 
     conn.commit()
     conn.close()
 
 # -------------------------------------------------------------
-# Backend da página de Cadastro (CadastroPage)
+# CRUD de alunos
 # -------------------------------------------------------------
 def add_student(
     nome: str,
@@ -91,17 +97,8 @@ def add_student(
     sexo: str = None,
     comorbidade: str = None
 ) -> dict:
-    """
-    Insere um novo aluno na tabela 'students'.
-    Recebe campos obrigatórios e opcionais.
-    Gera ID baseado em timestamp.
-    Retorna dict com dados completos do aluno (via get_student_full).
-    """
     init_db()
-    # Gerar ID único
     student_id = f"STU{int(datetime.now().timestamp())}"
-
-    # Inserir no banco
     conn = get_connection()
     c = conn.cursor()
     c.execute(
@@ -118,17 +115,27 @@ def add_student(
     )
     conn.commit()
     conn.close()
-
-    # Retornar dados completos do aluno cadastrado
     return get_student_full(cpf)
 
+def get_student_by_cpf(cpf: str) -> dict:
+    return get_student_full(cpf)
+
+def delete_student(cpf: str) -> bool:
+    init_db()
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('DELETE FROM students WHERE cpf = ?;', (cpf,))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
 # -------------------------------------------------------------
-# Backend da página de Frequência (FrequenciaPage)
+# Frequência e justificativas
 # -------------------------------------------------------------
 def record_attendance(student_id: str, date_str: str, present: bool) -> None:
     """
-    Registra presença (present=True) ou falta (present=False).
-    Armazena em 'attendance': student_id, data e status presente.
+    Registra presença (present=True) ou falta (present=False) no dia especificado.
     date_str deve estar no formato 'YYYY-MM-DD'.
     """
     init_db()
@@ -141,133 +148,99 @@ def record_attendance(student_id: str, date_str: str, present: bool) -> None:
     conn.commit()
     conn.close()
 
-# -------------------------------------------------------------
-# Backend da página de Informações (InformacoesPage)
-# -------------------------------------------------------------
-def get_student_full(cpf: str) -> dict:
+def justify_absence(student_id: str, date_str: str, reason: str, canceled: bool) -> None:
     """
-    Recupera dados completos do aluno e estatísticas de frequência.
-    - Carrega dados pessoais da tabela students
-    - Carrega histórico de attendance
-    - Usa pandas para processar datas e agregações
-    - Usa scikit-learn LogisticRegression para estimar chance de evasão
-    Retorna dict com todos os campos solicitados.
+    Insere uma justificativa de falta para o aluno.
+    'canceled' indica se o aluno cancelou a presença.
     """
     init_db()
     conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO justifications (student_id, date, reason, canceled)
+        VALUES (?, ?, ?, ?);
+        ''',
+        (student_id, date_str, reason, int(canceled))
+    )
+    conn.commit()
+    conn.close()
 
-    # Carregar dados do aluno em DataFrame
-    student_df = pd.read_sql_query(
-        'SELECT * FROM students WHERE cpf = ?;',
+def get_attendance_history(student_id: str) -> pd.DataFrame:
+    """
+    Retorna DataFrame com histórico de presença/falta e justificativas.
+    """
+    init_db()
+    conn = get_connection()
+    df_att = pd.read_sql_query(
+        '''
+        SELECT a.date, a.present, j.reason, j.canceled
+        FROM attendance a
+        LEFT JOIN justifications j
+          ON a.student_id = j.student_id AND a.date = j.date
+        WHERE a.student_id = ?
+        ORDER BY a.date;
+        ''',
         conn,
-        params=(cpf,),
-        parse_dates=['data_matricula', 'data_nascimento']
+        params=(student_id,),
+        parse_dates=['date']
+    )
+    conn.close()
+    return df_att
+
+# -------------------------------------------------------------
+# Informações e cálculo de evasão
+# -------------------------------------------------------------
+def get_student_full(cpf: str) -> dict:
+    init_db()
+    conn = get_connection()
+    student_df = pd.read_sql_query(
+        'SELECT * FROM students WHERE cpf = ?;', conn,
+        params=(cpf,), parse_dates=['data_matricula', 'data_nascimento']
     )
     if student_df.empty:
         conn.close()
         return None
     student = student_df.iloc[0]
-
-    # Carregar histórico de attendance em DataFrame
     attendance_df = pd.read_sql_query(
-        'SELECT date, present FROM attendance WHERE student_id = ?;',
-        conn,
-        params=(student.id,),
-        parse_dates=['date']
+        'SELECT present FROM attendance WHERE student_id = ?;',
+        conn, params=(student.id,)
     )
     conn.close()
-
-    # --------- Cálculos estatísticos ---------
-    # Idade
+    dias_presentes = int(attendance_df['present'].sum())
+    dias_faltas = len(attendance_df) - dias_presentes
+    total_contratado = student.dias_contratados
+    chance_evasao = round((dias_faltas / total_contratado) * 100, 2) if total_contratado > 0 else 0.0
+    today = date.today()
+    idade = None
     if pd.notna(student.data_nascimento):
-        today = pd.to_datetime(date.today())
-        idade = (
-            today.year - student.data_nascimento.year
-            - ((today.month, today.day) < (student.data_nascimento.month, student.data_nascimento.day))
-        )
-    else:
-        idade = None
-
-    # Tempo de matrícula em meses
-    today = pd.to_datetime(date.today())
-    months = (
-        (today.year - student.data_matricula.year) * 12
-        + today.month - student.data_matricula.month
-    )
-
-    # Frequência do mês atual
-    attendance_df['mes'] = attendance_df['date'].dt.to_period('M')
-    current_period = today.to_period('M')
-    df_current = attendance_df[attendance_df['mes'] == current_period]
-    dias_presentes = int(df_current['present'].sum())
-    dias_faltas = int(student.dias_contratados - dias_presentes)
-
-    # Preparar dados para modelo de evasão
-    # Agrupar por mês e calcular presentes, faltas
-    agg = attendance_df.groupby('mes').agg(
-        presentes=('present', 'sum'), total=('present', 'count')
-    ).reset_index()
-    agg['faltas'] = agg['total'] - agg['presentes']
-    # Criar variável alvo simplificada: churn=1 se faltas>metade dos dias contratados
-    agg['churn'] = (agg['faltas'] > student.dias_contratados / 2).astype(int)
-
-    # Treinar modelo se houver dados suficientes
-    model = LogisticRegression()
-    if len(agg) >= 2:
-        X = agg[['presentes', 'faltas']]
-        y = agg['churn']
-        model.fit(X, y)
-        prob = model.predict_proba([[dias_presentes, dias_faltas]])[0][1]
-        chance_evasao = round(float(prob * 100), 2)
-    else:
-        # Fallback direto sem modelo
-        chance_evasao = round((dias_faltas / student.dias_contratados) * 100, 2)
-
-    # Status de matrícula baseado em 50% de presença
-    status = 'Ativo' if dias_presentes >= student.dias_contratados * 0.5 else 'Inativo'
-
-    # Montar dict de saída
+        dn = student.data_nascimento
+        idade = today.year - dn.year - ((today.month, today.day) < (dn.month, dn.day))
+    dm = student.data_matricula
+    meses = (today.year - dm.year)*12 + today.month - dm.month
+    status = 'Ativo' if dias_presentes >= total_contratado * 0.5 else 'Inativo'
     return {
         'id': student.id,
         'nome': student.nome,
         'cpf': student.cpf,
+        'telefone': student.telefone,
         'data_matricula': student.data_matricula.strftime('%Y-%m-%d'),
         'data_nascimento': (
-            student.data_nascimento.strftime('%Y-%m-%d')
-            if pd.notna(student.data_nascimento) else None
+            student.data_nascimento.strftime('%Y-%m-%d') if pd.notna(student.data_nascimento) else None
         ),
         'idade': idade,
-        'sexo': student.sexo,
-        'comorbidade': student.comorbidade,
-        'dias_contratados': int(student.dias_contratados),
+        'dias_contratados': int(total_contratado),
         'dias_presentes': dias_presentes,
         'dias_faltas': dias_faltas,
         'status_matricula': status,
-        'tempo_matricula_meses': int(months),
+        'tempo_matricula_meses': meses,
         'chance_evasao_percent': chance_evasao,
         'valor_plano': float(student.valor_plano)
     }
 
 # -------------------------------------------------------------
-# Backend da página de Exclusão (InformacoesPage -> Excluir)
-# -------------------------------------------------------------
-def delete_student(cpf: str) -> bool:
-    """
-    Remove o aluno identificado pelo CPF e seus registros de attendance.
-    Retorna True se removeu, False se não encontrado.
-    """
-    init_db()
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('DELETE FROM students WHERE cpf = ?;', (cpf,))
-    affected = c.rowcount
-    conn.commit()
-    conn.close()
-    return affected > 0
-
-# -------------------------------------------------------------
-# Execução direta para inicializar o DB
+# Execução direta
 # -------------------------------------------------------------
 if __name__ == '__main__':
     init_db()
-    print('Banco de dados helpfit.db inicializado!')
+    print('Banco de dados helpfit.db inicializado e migrado!')
